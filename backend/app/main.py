@@ -1,28 +1,62 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import requests
+from app.memory import init_db, save_message, get_recent_messages
 
 app = FastAPI()
 
-# This defines what shape of JSON data we expect in the request body.
-# FastAPI uses this to auto-validate incoming requests — if someone
-# sends a request without "message", it auto-rejects with a clear error.
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Create the messages table on startup if it doesn't exist yet
+init_db()
+
 class ChatRequest(BaseModel):
     message: str
 
+def build_prompt(history, new_message: str) -> str:
+    """
+    Turns the conversation history into a single text block
+    the model can read as context, then appends the new question.
+    """
+    prompt = ""
+    for role, content in history:
+        if role == "user":
+            prompt += f"User: {content}\n"
+        else:
+            prompt += f"AI: {content}\n"
+    prompt += f"User: {new_message}\nAI:"
+    return prompt
+
 @app.post("/chat")
 def chat(request: ChatRequest):
-    # This is the local API Ollama exposes — we talked about this earlier.
-    # It's running on YOUR machine, port 11434.
-    ollama_url = "http://localhost:11434/api/generate"
+    # 1. Save the user's new message first
+    save_message("user", request.message)
 
+    # 2. Pull recent history (includes the message we just saved)
+    history = get_recent_messages(limit=10)
+
+    # 3. Build the full prompt with context
+    full_prompt = build_prompt(history[:-1], request.message)
+
+    # 4. Call Ollama with the FULL conversation as context, not just one line
+    ollama_url = "http://localhost:11434/api/generate"
     payload = {
         "model": "llama3.2:1b",
-        "prompt": request.message,
-        "stream": False  # we'll explain streaming later — keep it simple for now
+        "prompt": full_prompt,
+        "stream": False
     }
-
     response = requests.post(ollama_url, json=payload)
     result = response.json()
+    ai_reply = result["response"]
 
-    return {"reply": result["response"]}
+    # 5. Save the AI's reply too, so the NEXT request includes it
+    save_message("assistant", ai_reply)
+
+    return {"reply": ai_reply}
